@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 from pathlib import Path
 
@@ -29,6 +30,47 @@ def test_duplicate_same_outcome_second_claim_loses(tmp_path: Path) -> None:
     assert writer.claim_terminal("stage-a", "timeout") is True
     assert writer.claim_terminal("stage-a", "timeout") is False
 
+    receipts = list_terminal_receipts(tmp_path, "stage-a")
+    assert len(receipts) == 1
+    assert receipts[0].read_text(encoding="utf-8") == "timeout"
+
+
+def test_cross_outcome_second_claim_loses_without_overwrite(tmp_path: Path) -> None:
+    writer = ReceiptWriter(tmp_path)
+    assert writer.claim_terminal("stage-a", "done") is True
+    assert writer.claim_terminal("stage-a", "timeout") is False
+
+    receipts = list_terminal_receipts(tmp_path, "stage-a")
+    assert len(receipts) == 1
+    assert receipts[0].name == "stage-a.terminal"
+    assert receipts[0].read_text(encoding="utf-8") == "done"
+
+
+def test_existing_terminal_receipt_cannot_be_overwritten(tmp_path: Path) -> None:
+    preexisting = tmp_path / "stage-a.terminal"
+    preexisting.write_text("timeout", encoding="utf-8")
+
+    writer = ReceiptWriter(tmp_path)
+    assert writer.claim_terminal("stage-a", "done") is False
+    assert preexisting.read_text(encoding="utf-8") == "timeout"
+    assert list_terminal_receipts(tmp_path, "stage-a") == [preexisting]
+
+
+def test_failed_write_releases_claim_so_retry_can_succeed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    writer = ReceiptWriter(tmp_path)
+
+    def boom(_fd: int, _data: bytes) -> int:
+        raise OSError("simulated partial/failed write")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(os, "write", boom)
+        with pytest.raises(OSError, match="simulated partial/failed write"):
+            writer.claim_terminal("stage-a", "done")
+
+    assert list_terminal_receipts(tmp_path, "stage-a") == []
+    assert writer.claim_terminal("stage-a", "timeout") is True
     receipts = list_terminal_receipts(tmp_path, "stage-a")
     assert len(receipts) == 1
     assert receipts[0].read_text(encoding="utf-8") == "timeout"

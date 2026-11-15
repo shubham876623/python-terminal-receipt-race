@@ -1,26 +1,33 @@
-"""Terminal receipt writer (Phase 1: deliberately buggy).
+"""Terminal receipt writer with a single stage-level claim.
 
-BUG
----
-Completion and watchdog record terminal outcomes on *separate* paths
-(``{stage}.done`` vs ``{stage}.timeout``). There is no shared in-process
-decision and no canonical stage-level claim, so both threads can succeed
-and leave two terminal receipts for one stage.
+Guarantees (same process, shared ``ReceiptWriter`` instance)
+-----------------------------------------------------------
+* ``done`` and ``timeout`` compete for one canonical path:
+  ``{stage}.terminal``.
+* A ``threading.Lock`` serializes the in-process claim decision.
+* ``O_CREAT | O_EXCL`` refuses to open an existing receipt, so a loser
+  cannot overwrite a winner's file.
 
-Hooks
------
-``ReceiptHooks.before_create`` runs immediately before filesystem creation
-and must never execute while holding a claim lock. Test barriers belong
-here so a later locked implementation cannot deadlock two waiters.
+Non-guarantees
+--------------
+* Not crash-safe: a crash after exclusive create and before a complete
+  write can leave a partial or empty claim that blocks further claims.
+* ``close`` without ``fsync`` is not a durability / power-loss guarantee.
+* Exclusive create is an atomic *claim*; it is not exactly-once execution
+  of arbitrary side effects around the claim.
+* The lock is per writer instance. Two instances on the same directory
+  do not share a decision point.
 """
 
 from __future__ import annotations
 
 import os
+import threading
 from collections.abc import Callable
 from pathlib import Path
 
 TERMINAL_OUTCOMES = frozenset({"done", "timeout"})
+TERMINAL_SUFFIX = ".terminal"
 
 
 class ReceiptHooks:
@@ -41,22 +48,29 @@ class ReceiptWriter:
         self._directory = Path(directory)
         self._directory.mkdir(parents=True, exist_ok=True)
         self._hooks = hooks or ReceiptHooks()
+        self._lock = threading.Lock()
 
     def claim_terminal(self, stage: str, outcome: str) -> bool:
-        """Attempt to record a terminal outcome for ``stage``.
+        """Attempt to record the sole terminal outcome for ``stage``.
 
-        Returns True if this call created a receipt file, False if that
-        outcome-specific path already existed.
+        Returns True if this call created the canonical receipt, False if
+        the stage was already claimed. Completion and watchdog must both
+        call this function.
         """
         _validate_stage(stage)
         if outcome not in TERMINAL_OUTCOMES:
             raise ValueError(f"invalid terminal outcome: {outcome!r}")
 
-        # BUG: outcome-specific path — done and timeout do not compete.
-        path = self._directory / f"{stage}.{outcome}"
+        path = self._directory / f"{stage}{TERMINAL_SUFFIX}"
 
+        # Synchronization for tests must stay outside the lock. A barrier
+        # here cannot deadlock two claimers; a barrier under the lock can.
         self._hooks.before_create()
 
+        with self._lock:
+            return self._create_exclusive(path, outcome)
+
+    def _create_exclusive(self, path: Path, outcome: str) -> bool:
         flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
         if hasattr(os, "O_BINARY"):
             flags |= os.O_BINARY
@@ -70,7 +84,8 @@ class ReceiptWriter:
             _write_all(fd, outcome.encode("utf-8"))
         except Exception:
             os.close(fd)
-            # This call created the file exclusively; remove our partial claim.
+            # Safe only because this call exclusively created ``path``.
+            # Never unlink a receipt we did not just create.
             try:
                 os.unlink(path)
             except FileNotFoundError:
@@ -84,15 +99,16 @@ class ReceiptWriter:
 def list_terminal_receipts(directory: Path | str, stage: str) -> list[Path]:
     """Existing terminal receipt paths for ``stage``.
 
-    Includes both the buggy outcome-specific names and a future canonical
-    ``{stage}.terminal`` claim so the regression test stays stable across
-    the fix without rewriting assertions.
+    Includes legacy outcome-specific names from the buggy Phase 1 writer
+    and the canonical ``{stage}.terminal`` claim so the regression test
+    stays stable and would still flag a regression that recreates dual
+    outcome files.
     """
     root = Path(directory)
     candidates = [
         root / f"{stage}.done",
         root / f"{stage}.timeout",
-        root / f"{stage}.terminal",
+        root / f"{stage}{TERMINAL_SUFFIX}",
     ]
     return [path for path in candidates if path.is_file()]
 
