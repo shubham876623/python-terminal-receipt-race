@@ -11,7 +11,9 @@ Guarantees (same process, shared ``ReceiptWriter`` instance)
 Non-guarantees
 --------------
 * Not crash-safe: a crash after exclusive create and before a complete
-  write can leave a partial or empty claim that blocks further claims.
+  write can leave a partial or empty claim. Cleanup ``unlink`` runs only
+  on the exception path of the creating call; incomplete receipts are not
+  repaired automatically and can block further claims.
 * ``close`` without ``fsync`` is not a durability / power-loss guarantee.
 * Exclusive create is an atomic *claim*; it is not exactly-once execution
   of arbitrary side effects around the claim.

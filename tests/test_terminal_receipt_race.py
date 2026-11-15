@@ -76,6 +76,35 @@ def test_failed_write_releases_claim_so_retry_can_succeed(
     assert receipts[0].read_text(encoding="utf-8") == "timeout"
 
 
+def test_completion_and_watchdog_share_one_writer_and_lock(tmp_path: Path) -> None:
+    """Demonstrated usage: both threads close over one ReceiptWriter / Lock."""
+    writer = ReceiptWriter(tmp_path)
+    barrier = threading.Barrier(parties=2, timeout=5)
+    observed: list[tuple[int, int]] = []
+    guard = threading.Lock()
+
+    def worker(outcome: str) -> None:
+        barrier.wait()
+        with guard:
+            observed.append((id(writer), id(writer._lock)))
+        writer.claim_terminal("stage-a", outcome)
+
+    threads = [
+        threading.Thread(target=worker, args=("done",), name="completion"),
+        threading.Thread(target=worker, args=("timeout",), name="watchdog"),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+        assert not thread.is_alive(), f"{thread.name} did not finish"
+
+    assert len(observed) == 2
+    assert observed[0] == observed[1]
+    assert observed[0] == (id(writer), id(writer._lock))
+    assert len(list_terminal_receipts(tmp_path, "stage-a")) == 1
+
+
 def test_competing_done_and_timeout_create_only_one_terminal_receipt(
     tmp_path: Path,
 ) -> None:
