@@ -18,7 +18,17 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
         with:
+          # Full history so workflow_dispatch can check out historical SHAs
+          # (e.g. the Phase 1 failing commit) while the workflow file comes from main.
+          fetch-depth: 0
           ref: ${{ github.event.inputs.checkout_ref || github.sha }}
+
+      - name: Show checked-out revision
+        run: |
+          echo "github.sha=${{ github.sha }}"
+          echo "checkout_ref input=${{ github.event.inputs.checkout_ref }}"
+          git rev-parse HEAD
+          git log -1 --oneline
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
